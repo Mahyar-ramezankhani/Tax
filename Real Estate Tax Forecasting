@@ -1,0 +1,189 @@
+# RET Prediction with RL, SLF, and ABC Optimization
+# ----------------------------------------------------
+# Developed using:
+# - Python 3.8.13, PyTorch 1.12.1 (with CUDA 11.6)
+# - Scikit-learn 0.24.2 for preprocessing and metrics
+# - OpenAI Gym 0.21.0 for custom RL environments
+# ----------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, r2_score
+from torch.distributions import Categorical
+import torch.nn.functional as F
+import gym
+import random
+import copy
+
+
+# -----------------------------
+# Data Handling and Preprocessing
+# -----------------------------
+class DataProcessor:
+    def __init__(self, df, target_col):
+        self.df = df
+        self.target_col = target_col
+
+    def handle_missing(self):
+        num_cols = self.df.select_dtypes(include=['int64', 'float64']).columns
+        cat_cols = self.df.select_dtypes(include=['object', 'category']).columns
+        for col in num_cols:
+            if self.df[col].skew() > 1:
+                self.df[col].fillna(self.df[col].median(), inplace=True)
+            else:
+                self.df[col].fillna(self.df[col].mean(), inplace=True)
+        for col in cat_cols:
+            self.df[col].fillna(self.df[col].mode()[0], inplace=True)
+
+    def remove_outliers(self):
+        for col in ['price', 'area']:
+            if col in self.df.columns:
+                Q1 = self.df[col].quantile(0.25)
+                Q3 = self.df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                self.df = self.df[(self.df[col] >= lower) & (self.df[col] <= upper)]
+
+    def encode_and_scale(self):
+        cat_cols = self.df.select_dtypes(include=['object', 'category']).columns
+        num_cols = self.df.select_dtypes(include=['int64', 'float64']).columns.drop(self.target_col)
+        df_encoded = pd.get_dummies(self.df[cat_cols], drop_first=True)
+        scaler = StandardScaler()
+        df_scaled = pd.DataFrame(scaler.fit_transform(self.df[num_cols]), columns=num_cols)
+        y = self.df[self.target_col].values
+        X = pd.concat([df_scaled, df_encoded], axis=1)
+        return train_test_split(X.values, y, test_size=0.2, random_state=42)
+
+
+# -----------------------------
+# MLP Model for Feature Scoring & Prediction
+# -----------------------------
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, activation_fn, dropout):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_dim = input_dim if i == 0 else hidden_dim
+            layers.extend([nn.Linear(in_dim, hidden_dim), activation_fn(), nn.Dropout(dropout)])
+        self.network = nn.Sequential(*layers)
+        self.score_head = nn.Linear(hidden_dim, input_dim)
+        self.value_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = self.network(x)
+        scores = self.score_head(x)
+        prediction = self.value_head(x).squeeze(-1)
+        return scores, prediction
+
+
+# -----------------------------
+# Reinforcement Learning Environment
+# -----------------------------
+class FeatureSelectionEnv(gym.Env):
+    def __init__(self, X, y, model, lam):
+        super().__init__()
+        self.X, self.y, self.model = X, y, model
+        self.lam = lam
+        self.reset()
+
+    def reset(self):
+        self.idx = np.random.randint(len(self.X))
+        self.active_features = set()
+        self.done = False
+        return self._get_state()
+
+    def _get_state(self):
+        x = torch.tensor(self.X[self.idx], dtype=torch.float32)
+        scores, _ = self.model(x)
+        return torch.cat([x, scores, torch.tensor(list(self.active_features) + [0]*(x.shape[0] - len(self.active_features)))], dim=0)
+
+    def step(self, action):
+        if action < self.X.shape[1]:
+            self.active_features.add(action)
+            reward = -self.lam * 1  # Assume cost of each feature = 1
+            done = False
+        else:
+            x = torch.tensor(self.X[self.idx], dtype=torch.float32)
+            y_true = self.y[self.idx]
+            _, y_pred = self.model(x)
+            reward = -((y_true - y_pred.item())**2)
+            done = True
+        return self._get_state(), reward, done, {}
+
+
+# -----------------------------
+# Scope Loss Function (SLF)
+# -----------------------------
+def scope_loss(logits, actions, advantages, gamma=1.0):
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    selected_log_probs = log_probs[range(len(actions)), actions]
+    weights = (1 - probs[range(len(actions)), actions]) ** gamma
+    slf = -weights * selected_log_probs * advantages
+    return slf.mean()
+
+
+# -----------------------------
+# PPO Agent
+# -----------------------------
+class PPOAgent:
+    def __init__(self, model, lr):
+        self.model = model
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    def update(self, states, actions, rewards):
+        logits, values = self.model(states)
+        advantages = rewards - values.detach()
+        loss = scope_loss(logits, actions, advantages)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+
+# -----------------------------
+# ABC Optimizer (simplified)
+# -----------------------------
+class ABCOptimizer:
+    def __init__(self, fitness_func, dim, bounds, pop_size=20, limit=5, max_iter=50):
+        self.fitness_func = fitness_func
+        self.bounds = bounds
+        self.dim = dim
+        self.pop_size = pop_size
+        self.limit = limit
+        self.max_iter = max_iter
+
+    def optimize(self):
+        pop = np.random.uniform(0, 1, (self.pop_size, self.dim))
+        fitness = np.array([self.fitness_func(ind) for ind in pop])
+        for _ in range(self.max_iter):
+            for i in range(self.pop_size):
+                phi = np.random.uniform(-1, 1, self.dim)
+                k = np.random.randint(self.pop_size)
+                while k == i:
+                    k = np.random.randint(self.pop_size)
+                new = np.clip(pop[i] + phi * (pop[i] - pop[k]), 0, 1)
+                new_fit = self.fitness_func(new)
+                if new_fit < fitness[i]:
+                    pop[i], fitness[i] = new, new_fit
+        best_idx = np.argmin(fitness)
+        return pop[best_idx]
+
+
+# -----------------------------
+# Evaluation Metrics
+# -----------------------------
+def evaluate(y_true, y_pred):
+    return {
+        'MSE': mean_squared_error(y_true, y_pred),
+        'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+        'R2': r2_score(y_true, y_pred)
+    }
+
+# End of pipeline
